@@ -201,6 +201,19 @@ def LowerProcessesPass : Pass<"arc-lower-processes", "mlir::ModuleOp"> {
   ];
 }
 
+def LowerLLHDCoroutinesPass : Pass<"arc-lower-llhd-coroutines", "mlir::ModuleOp"> {
+  let summary = "Lower LLHD coroutines into arc coroutines";
+  let description = [{
+    TODO(alex)
+  }];
+  let dependentDialects = [
+    "arc::ArcDialect",
+    "comb::CombDialect",
+    "hw::HWDialect",
+    "llhd::LLHDDialect",
+  ];
+}
+
 def LowerCoroutinesPass : Pass<"arc-lower-coroutines", "mlir::ModuleOp"> {
   let summary = "Lower coroutines to state machine functions";
   let description = [{

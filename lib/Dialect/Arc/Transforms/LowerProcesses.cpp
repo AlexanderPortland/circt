@@ -68,10 +68,15 @@ using llvm::SmallDenseSet;
 
 namespace {
 
+enum LLHDCoroutineKind {
+  Coroutine,
+  Process,
+};
+
 /// Worker that lowers a single `llhd.process` op.
-struct ProcessLowering {
-  ProcessLowering(llhd::ProcessOp processOp, SymbolTable &symbolTable)
-      : processOp(processOp), symbolTable(symbolTable) {}
+struct CoroutineLowering {
+  CoroutineLowering(llhd::ProcessOp processOp, SymbolTable &symbolTable)
+      : sourceOp(processOp), opKind(LLHDCoroutineKind::Process), symbolTable(symbolTable) {}
 
   LogicalResult run();
 
@@ -80,11 +85,47 @@ private:
   void createCoroutine();
   void addEntryAndResumeBlockArguments();
   LogicalResult rewriteTerminators();
+  void renameArguments();
   void renameCoroutineArgument(unsigned argIdx, Liveness &liveness,
                                DominanceInfo &dominance);
   void buildInstance();
 
-  llhd::ProcessOp processOp;
+  bool isProcess() {
+    return opKind == LLHDCoroutineKind::Process;
+  }
+
+  bool isCoroutine() {
+    return opKind == LLHDCoroutineKind::Coroutine;
+  }
+
+  llhd::ProcessOp getProcess() {
+    assert(isProcess());
+    return cast<llhd::ProcessOp>(sourceOp);
+  }
+
+  llhd::CoroutineOp getCoroutine() {
+    assert(isCoroutine());
+    return cast<llhd::CoroutineOp>(sourceOp);
+  }
+
+  Region& getBody() {
+    if (isProcess()) {
+      return getProcess().getBody();
+    } else {
+      return getCoroutine().getBody();
+    }
+  }
+
+  auto getLoc() {
+    if (isProcess()) {
+      return getProcess().getLoc();
+    } else {
+      return getCoroutine().getLoc();
+    }
+  }
+
+  Operation* sourceOp;
+  LLHDCoroutineKind opKind;
   SymbolTable &symbolTable;
 
   /// The coroutine created for this process. Populated by `createCoroutine`.
@@ -124,8 +165,8 @@ private:
 // Helpers
 //===----------------------------------------------------------------------===//
 
-void ProcessLowering::collectCaptures() {
-  auto &body = processOp.getBody();
+void CoroutineLowering::collectCaptures() {
+  auto &body = getBody();
   auto builder = OpBuilder::atBlockBegin(&body.front());
   SmallDenseSet<Value> captureSet;
   DenseMap<Operation *, Operation *> clonedConstants;
@@ -156,9 +197,10 @@ void ProcessLowering::collectCaptures() {
   });
 }
 
-void ProcessLowering::createCoroutine() {
+void CoroutineLowering::createCoroutine() {
+  auto processOp = getProcess(); // TODO: this should also support coroutines
   // Find the parent module and use it as the insertion anchor.
-  auto hwModule = processOp->getParentOfType<hw::HWModuleOp>();
+  auto hwModule = sourceOp->getParentOfType<hw::HWModuleOp>();
   assert(hwModule);
   OpBuilder builder(hwModule);
 
@@ -211,9 +253,9 @@ void ProcessLowering::createCoroutine() {
 /// Uses of the original outside captures inside the body are also rewritten
 /// to the entry block's new capture arguments here, so by the time renaming
 /// runs every reference is to an internal SSA value defined at the entry.
-void ProcessLowering::addEntryAndResumeBlockArguments() {
+void CoroutineLowering::addEntryAndResumeBlockArguments() {
   auto &body = coroOp.getBody();
-  auto loc = processOp.getLoc();
+  auto loc = getLoc();
 
   // Assemble the initial resume block argument types that will be provided by
   // callers entering or re-entering the coroutine.
@@ -279,7 +321,7 @@ void ProcessLowering::addEntryAndResumeBlockArguments() {
 /// the wait's delay. A `llhd.wait` with an `observed` clause yields an observe
 /// bitmask with the bit of each observed coroutine argument set; ops without a
 /// delay and without observed values can never resume and are treated as halts.
-LogicalResult ProcessLowering::rewriteTerminators() {
+LogicalResult CoroutineLowering::rewriteTerminators() {
   // The observe bitmask has one bit per coroutine argument. `argIndices` maps
   // the block arguments that stand in for coroutine arguments to their bit
   // index; block arguments beyond that prefix (a wait's forwarded destination
@@ -364,7 +406,7 @@ LogicalResult ProcessLowering::rewriteTerminators() {
 ///
 /// This mirrors the capture rewriting we do in `LowerCoroutines` as part of the
 /// `captureValue` function.
-void ProcessLowering::renameCoroutineArgument(unsigned argIdx,
+void CoroutineLowering::renameCoroutineArgument(unsigned argIdx,
                                               Liveness &liveness,
                                               DominanceInfo &dominance) {
   auto &body = coroOp.getBody();
@@ -444,9 +486,26 @@ void ProcessLowering::renameCoroutineArgument(unsigned argIdx,
   }
 }
 
+void CoroutineLowering::renameArguments() {
+  // SSA-rename each coroutine entry argument through the CFG. With a single
+  // block, every use is already in the entry block and refers to the entry
+  // arg directly, so there is nothing to thread; `DominanceInfo` also asserts
+  // on single-block regions.
+  if (!coroOp.getBody().hasOneBlock()) {
+    Liveness liveness(coroOp);
+    DominanceInfo dominance(coroOp);
+    for (unsigned argIdx = 0, argNum = entryArgs.size(); argIdx != argNum;
+         ++argIdx)
+      renameCoroutineArgument(argIdx, liveness, dominance);
+  }
+}
+
 /// Create an `arc.coroutine.instance` that instantiates the outlined coroutine
 /// in place of the old `llhd.process`.
-void ProcessLowering::buildInstance() {
+void CoroutineLowering::buildInstance() {
+  assert(isProcess() && "an arc.coroutine.instance should only be built from an llhd.process");
+  auto processOp = getProcess();
+
   OpBuilder builder(processOp);
   auto loc = processOp.getLoc();
 
@@ -459,27 +518,37 @@ void ProcessLowering::buildInstance() {
   processOp.replaceAllUsesWith(instanceOp.getResults());
   processOp.erase();
 }
+/// My concept of the method for lowering a coroutine/process is as follows:
+/// Phase A: (per coroutine/proc)
+/// 1. collect captures - PROC ONLY, determine formal args - CORO ONLY
+/// 2. create arc.coroutine.define - BOTH
+/// 3. do all the generic stuff already implemented
+///      addEntryAndResumeBlockArguments, renameArguments, rewriteTerminators
+/// NOTE: must add return handling to rewriteTerminators
+/// 4. build instance (for PROC) or save arc.coroutine.define op (for CORO)
 
-LogicalResult ProcessLowering::run() {
-  collectCaptures();
+/// Phase B: (whole module)
+/// replace all llhd.call_coroutine calls in the module with arc.coroutine.call calls to the corresponding arc coroutine as saved in A4.
+LogicalResult CoroutineLowering::run() {
+  if (isProcess()) {
+    collectCaptures();
+  } else {
+    assert(false && "TODO: determined proper arguments for COROUTINES");
+  }
+
   createCoroutine();
   addEntryAndResumeBlockArguments();
   if (failed(rewriteTerminators()))
     return failure();
 
-  // SSA-rename each coroutine entry argument through the CFG. With a single
-  // block, every use is already in the entry block and refers to the entry
-  // arg directly, so there is nothing to thread; `DominanceInfo` also asserts
-  // on single-block regions.
-  if (!coroOp.getBody().hasOneBlock()) {
-    Liveness liveness(coroOp);
-    DominanceInfo dominance(coroOp);
-    for (unsigned argIdx = 0, argNum = entryArgs.size(); argIdx != argNum;
-         ++argIdx)
-      renameCoroutineArgument(argIdx, liveness, dominance);
+  renameArguments();
+  
+  if (isProcess()) {
+    buildInstance();
+  } else {
+    assert(false && "TODO: save defined op for replacement of COROUTINES");
   }
 
-  buildInstance();
   return success();
 }
 
@@ -500,7 +569,7 @@ void LowerProcessesPass::runOnOperation() {
 
   bool anyFailed = false;
   module.walk([&](llhd::ProcessOp op) {
-    ProcessLowering lowering(op, symbolTable);
+    CoroutineLowering lowering(op, symbolTable);
     if (failed(lowering.run()))
       anyFailed = true;
   });
