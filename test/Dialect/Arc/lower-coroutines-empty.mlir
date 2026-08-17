@@ -1,5 +1,5 @@
-// RUN: arcilator %s --no-runtime --emit-mlir 
-// --debug-only=dialect-conversion --mlir-print-stacktrace-on-diagnostic
+// RUN: arcilator %s --no-runtime --emit-mlir --debug-only=dialect-conversion
+//  --mlir-print-stacktrace-on-diagnostic
 hw.module @m(in %clk : i1, in %enable : i1) {
   llhd.process {
     cf.br ^bb1

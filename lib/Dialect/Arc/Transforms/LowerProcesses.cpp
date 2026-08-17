@@ -73,10 +73,15 @@ enum LLHDCoroutineKind {
   Process,
 };
 
+using ReplacementPair = std::pair<llvm::StringRef, llvm::StringRef>;
+
 /// Worker that lowers a single `llhd.process` op.
 struct CoroutineLowering {
   CoroutineLowering(llhd::ProcessOp processOp, SymbolTable &symbolTable)
-      : sourceOp(processOp), opKind(LLHDCoroutineKind::Process), symbolTable(symbolTable) {}
+      : sourceOp(processOp), opKind(LLHDCoroutineKind::Process), symbolTable(symbolTable), replacements(nullptr) {}
+
+  CoroutineLowering(llhd::CoroutineOp coroOp, SymbolTable &symbolTable, SmallVector<ReplacementPair>* replacements)
+      : sourceOp(coroOp), opKind(LLHDCoroutineKind::Coroutine), symbolTable(symbolTable), replacements(replacements) {}
 
   LogicalResult run();
 
@@ -89,6 +94,7 @@ private:
   void renameCoroutineArgument(unsigned argIdx, Liveness &liveness,
                                DominanceInfo &dominance);
   void buildInstance();
+  ReplacementPair callReplacementInfo();
 
   bool isProcess() {
     return opKind == LLHDCoroutineKind::Process;
@@ -116,6 +122,29 @@ private:
     }
   }
 
+  // TODO: is this the right way to do this for coroutines? what is the anchor for?
+  OpBuilder getOpBuilder() {
+    if (isProcess()) {
+      auto hwModule = sourceOp->getParentOfType<hw::HWModuleOp>();
+      assert(hwModule && "llhd processes should always have a parent module");
+      return OpBuilder(hwModule);
+    } else {
+      return OpBuilder(sourceOp->getContext());
+    }
+  }
+
+  auto coroutineName() {
+    if (isProcess()) {
+      auto hwModule = sourceOp->getParentOfType<hw::HWModuleOp>();
+      assert(hwModule && "llhd processes should always have a parent module");
+      return hwModule.getSymName() + ".llhd.process";
+    } else {
+      // assert(false && "TODO: how to uniquely name llhd coroutines?");
+      // TODO: is this a good way to uniquely identify coroutines? i think their names already have to be unique
+      return getCoroutine().getName() + ".llhd.coroutine";
+    }
+  }
+
   auto getLoc() {
     if (isProcess()) {
       return getProcess().getLoc();
@@ -127,12 +156,16 @@ private:
   Operation* sourceOp;
   LLHDCoroutineKind opKind;
   SymbolTable &symbolTable;
+  /// The vector in which to write the symbol names required for later replacing 
+  /// llhd.coroutine calls throughout the module.
+  SmallVector<ReplacementPair> *replacements;
 
-  /// The coroutine created for this process. Populated by `createCoroutine`.
-  CoroutineDefineOp coroOp;
+  /// The new coroutine definition created for this process. Populated by `createCoroutine`.
+  CoroutineDefineOp loweredCoroOp;
 
   /// External SSA values referenced inside the body that need to be threaded
   /// as coroutine arguments.
+  // TODO(alex): rename
   SmallVector<Value> captures;
 
   /// Block arguments of the coroutine entry block, mirroring `captures`.
@@ -166,6 +199,16 @@ private:
 //===----------------------------------------------------------------------===//
 
 void CoroutineLowering::collectCaptures() {
+  // `llhd.coroutine`s do not implicitly close over variables, so we get the lowered
+  // coroutines arguments straight from the old coroutine's body.
+  if (isCoroutine()) {
+    auto coroBody = &getCoroutine().getBody().front();
+    for (auto arg : coroBody->getArguments()) {
+      captures.push_back(arg);
+    }
+    return;
+  }
+
   auto &body = getBody();
   auto builder = OpBuilder::atBlockBegin(&body.front());
   SmallDenseSet<Value> captureSet;
@@ -198,11 +241,8 @@ void CoroutineLowering::collectCaptures() {
 }
 
 void CoroutineLowering::createCoroutine() {
-  auto processOp = getProcess(); // TODO: this should also support coroutines
   // Find the parent module and use it as the insertion anchor.
-  auto hwModule = sourceOp->getParentOfType<hw::HWModuleOp>();
-  assert(hwModule);
-  OpBuilder builder(hwModule);
+  OpBuilder builder = getOpBuilder();
 
   // Build the function type:
   // `(captureTypes...) -> (procResults..., iN mask, i64 wakeup)`, where
@@ -213,7 +253,7 @@ void CoroutineLowering::createCoroutine() {
   for (auto cap : captures)
     argTypes.push_back(cap.getType());
   auto maskType = builder.getIntegerType(argTypes.size());
-  SmallVector<Type> resultTypes(processOp.getResultTypes());
+  SmallVector<Type> resultTypes(sourceOp->getResultTypes());
   resultTypes.push_back(maskType);
   resultTypes.push_back(i64Type);
   auto funcType = builder.getFunctionType(argTypes, resultTypes);
@@ -221,18 +261,18 @@ void CoroutineLowering::createCoroutine() {
   // Pick a symbol name based on the parent hw.module's name. Insertion into
   // the symbol table uniquifies the name.
   auto funcName =
-      builder.getStringAttr(hwModule.getSymName() + ".llhd.process");
-  coroOp = CoroutineDefineOp::create(builder, processOp.getLoc(), funcName,
+      builder.getStringAttr(coroutineName());
+  loweredCoroOp = CoroutineDefineOp::create(builder, getLoc(), funcName,
                                      funcType);
-  symbolTable.insert(coroOp);
+  symbolTable.insert(loweredCoroOp);
 
   // Move the process body wholesale into the coroutine. Block arguments are
   // added in a separate step.
-  coroOp.getBody().takeBody(processOp.getBody());
+  loweredCoroOp.getBody().takeBody(getBody());
 
   // Retrieve the context value in the entry block.
-  builder.setInsertionPointToStart(&coroOp.getBody().front());
-  inferredContext = InferredContextOp::create(builder, coroOp.getLoc());
+  builder.setInsertionPointToStart(&loweredCoroOp.getBody().front());
+  inferredContext = InferredContextOp::create(builder, loweredCoroOp.getLoc());
 }
 
 /// Prepend the coroutine function-type prefix as leading block arguments to
@@ -254,19 +294,27 @@ void CoroutineLowering::createCoroutine() {
 /// to the entry block's new capture arguments here, so by the time renaming
 /// runs every reference is to an internal SSA value defined at the entry.
 void CoroutineLowering::addEntryAndResumeBlockArguments() {
-  auto &body = coroOp.getBody();
+  auto &body = loweredCoroOp.getBody();
   auto loc = getLoc();
 
   // Assemble the initial resume block argument types that will be provided by
   // callers entering or re-entering the coroutine.
   auto prefixTypes = TypeRange(captures);
-
-  // Add arguments to the entry block, recording each one's coroutine argument
-  // index so `rewriteTerminators` can map observed values to bitmask bits.
   auto &entry = body.front();
-  for (auto [index, type] : llvm::enumerate(prefixTypes)) {
-    entryArgs.push_back(entry.insertArgument(index, type, loc));
-    argIndices[entryArgs.back()] = index;
+
+  if (isCoroutine()) {
+    // The entry block already has the arguments. Just register them.
+    for (unsigned i = 0; i < captures.size(); ++i) {
+      entryArgs.push_back(entry.getArgument(i));
+      argIndices[entryArgs.back()] = i;
+    }
+  } else {
+    // Add arguments to the entry block, recording each one's coroutine argument
+    // index so `rewriteTerminators` can map observed values to bitmask bits.
+    for (auto [index, type] : llvm::enumerate(prefixTypes)) {
+      entryArgs.push_back(entry.insertArgument(index, type, loc));
+      argIndices[entryArgs.back()] = index;
+    }
   }
 
   // Collect the resume blocks, which are targets of `llhd.wait` ops.
@@ -329,7 +377,7 @@ LogicalResult CoroutineLowering::rewriteTerminators() {
   // therefore cannot be observed for changes.
   auto maskWidth = entryArgs.size();
   staticSensitivityMask.resize(maskWidth, false);
-  for (auto &block : coroOp.getBody()) {
+  for (auto &block : loweredCoroOp.getBody()) {
     auto *term = block.getTerminator();
     auto loc = term->getLoc();
     OpBuilder builder(term);
@@ -388,6 +436,13 @@ LogicalResult CoroutineLowering::rewriteTerminators() {
       halt.erase();
       continue;
     }
+  
+    // Handle `llhd.return` ops.
+    if (auto ret = dyn_cast<llhd::ReturnOp>(term)) {
+      CoroutineReturnOp::create(builder, loc, ret.getOperands());
+      ret.erase();
+      continue;
+    }
   }
 
   return success();
@@ -409,7 +464,7 @@ LogicalResult CoroutineLowering::rewriteTerminators() {
 void CoroutineLowering::renameCoroutineArgument(unsigned argIdx,
                                               Liveness &liveness,
                                               DominanceInfo &dominance) {
-  auto &body = coroOp.getBody();
+  auto &body = loweredCoroOp.getBody();
   auto entryArg = entryArgs[argIdx];
   auto *entryBlock = &body.front();
 
@@ -491,9 +546,9 @@ void CoroutineLowering::renameArguments() {
   // block, every use is already in the entry block and refers to the entry
   // arg directly, so there is nothing to thread; `DominanceInfo` also asserts
   // on single-block regions.
-  if (!coroOp.getBody().hasOneBlock()) {
-    Liveness liveness(coroOp);
-    DominanceInfo dominance(coroOp);
+  if (!loweredCoroOp.getBody().hasOneBlock()) {
+    Liveness liveness(loweredCoroOp);
+    DominanceInfo dominance(loweredCoroOp);
     for (unsigned argIdx = 0, argNum = entryArgs.size(); argIdx != argNum;
          ++argIdx)
       renameCoroutineArgument(argIdx, liveness, dominance);
@@ -512,12 +567,44 @@ void CoroutineLowering::buildInstance() {
   assert(captures.size() == staticSensitivityMask.size());
   auto instanceOp = CoroutineInstanceOp::create(
       builder, loc, processOp.getResultTypes(),
-      FlatSymbolRefAttr::get(coroOp.getSymNameAttr()), captures,
+      FlatSymbolRefAttr::get(loweredCoroOp.getSymNameAttr()), captures,
       builder.getDenseBoolArrayAttr(staticSensitivityMask));
 
   processOp.replaceAllUsesWith(instanceOp.getResults());
   processOp.erase();
 }
+
+ReplacementPair CoroutineLowering::callReplacementInfo() {
+  assert(isCoroutine() && "calls should only be replaced for an llhd.coroutine");
+
+  llvm::StringRef oldSymName = getCoroutine().getSymName();
+  llvm::StringRef newSymName = loweredCoroOp.getSymName();
+
+  return std::make_pair(oldSymName, newSymName);
+}
+
+// LogicalResult replaceCall(llhd::CallCoroutineOp oldCall, const ReplacementPair& replacement) {
+//   if (replacement.first != oldCall.getCallee()) {
+//     llvm::outs() << "replacement: " << replacement.first << " doesn't match call: " << oldCall << "\n";
+//     return failure();
+//   }
+//   llvm::outs() << "replacement: " << replacement.first << " MATCHES call: " << oldCall << "\n";
+
+//   OpBuilder builder(oldCall);
+//   auto loc = oldCall.getLoc();
+
+//   llvm::outs() << " part a \n";
+//   // auto newCall = CoroutineCallOp::create(builder, loc, oldCall.getResultTypes(), oldCall.getOperands());
+//   auto newCall = CoroutineCallOp::create(builder, loc, oldCall.getResultTypes(), FlatSymbolRefAttr::get(replacement.second), oldCall.getArgOperands());
+//   llvm::outs() << " part b \n";
+
+//   oldCall.replaceAllUsesWith(newCall);
+//   llvm::outs() << " part c \n";
+//   oldCall.erase();
+
+//   return success();
+// }
+
 /// My concept of the method for lowering a coroutine/process is as follows:
 /// Phase A: (per coroutine/proc)
 /// 1. collect captures - PROC ONLY, determine formal args - CORO ONLY
@@ -530,26 +617,61 @@ void CoroutineLowering::buildInstance() {
 /// Phase B: (whole module)
 /// replace all llhd.call_coroutine calls in the module with arc.coroutine.call calls to the corresponding arc coroutine as saved in A4.
 LogicalResult CoroutineLowering::run() {
+  collectCaptures();
   if (isProcess()) {
-    collectCaptures();
+    
   } else {
-    assert(false && "TODO: determined proper arguments for COROUTINES");
+    // assert(false && "TODO: determined proper arguments for COROUTINES");
   }
 
   createCoroutine();
   addEntryAndResumeBlockArguments();
-  if (failed(rewriteTerminators()))
+  if (failed(rewriteTerminators())) {
+    // assert(false && "TERMINATORS FAILED");
     return failure();
+  }
 
   renameArguments();
   
   if (isProcess()) {
     buildInstance();
   } else {
-    assert(false && "TODO: save defined op for replacement of COROUTINES");
+    replacements->push_back(callReplacementInfo());
   }
 
   return success();
+}
+
+void replaceCall(llhd::CallCoroutineOp oldCall, const ReplacementPair& replacement) {
+  OpBuilder builder(oldCall);
+
+        // auto newCall = CoroutineCallOp::create(
+        //     oldCall.getLoc(), 
+        //     oldCall.getResultTypes(), 
+        //     FlatSymbolRefAttr::get(builder.getContext(), replacement.second), 
+        //     oldCall.getArgOperands());
+            
+        oldCall.replaceAllUsesWith(newCall);
+        oldCall.erase();
+}
+
+void replaceCalls(ModuleOp& module, const SmallVector<ReplacementPair>& replacements) {
+  SmallVector<llhd::CallCoroutineOp> allCallCoroOps;
+  module.walk([&](llhd::CallCoroutineOp op) {
+    allCallCoroOps.push_back(op);
+  });
+
+  for (auto oldCall : allCallCoroOps) {
+    for (const auto& replacement : replacements) {
+      if (oldCall.getCallee() == replacement.first) {
+        llvm::outs() << "replacing " << oldCall << " bc it matches " << replacement.first << "\n";
+        replaceCall(oldCall, replacement);
+        break;
+      }
+    }
+  }
+
+  llvm::outs() << "in module: " << module << "\n";
 }
 
 //===----------------------------------------------------------------------===//
@@ -567,12 +689,26 @@ void LowerProcessesPass::runOnOperation() {
   auto module = getOperation();
   auto &symbolTable = getAnalysis<SymbolTable>();
 
+  SmallVector<ReplacementPair> replacements;
+
   bool anyFailed = false;
   module.walk([&](llhd::ProcessOp op) {
     CoroutineLowering lowering(op, symbolTable);
     if (failed(lowering.run()))
       anyFailed = true;
   });
+  module.walk([&](llhd::CoroutineOp op) {
+    CoroutineLowering lowering(op, symbolTable, &replacements);
+    if (failed(lowering.run()))
+      anyFailed = true;
+  });
+
   if (anyFailed)
     signalPassFailure();
+
+  if (replacements.size()) {
+    replaceCalls(module, replacements);
+    
+    llvm::outs() << "new module: " << module << "\n";
+  }
 }
