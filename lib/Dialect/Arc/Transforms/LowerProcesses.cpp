@@ -42,6 +42,7 @@
 #include "circt/Dialect/Arc/ArcOps.h"
 #include "circt/Dialect/Arc/ArcPasses.h"
 #include "circt/Dialect/Comb/CombOps.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/LLHD/LLHDOps.h"
 #include "mlir/Analysis/Liveness.h"
@@ -438,8 +439,16 @@ LogicalResult CoroutineLowering::rewriteTerminators() {
     }
   
     // Handle `llhd.return` ops.
+    // TODO: can this logic be condensed?
     if (auto ret = dyn_cast<llhd::ReturnOp>(term)) {
-      CoroutineReturnOp::create(builder, loc, ret.getOperands());
+      auto mask = hw::ConstantOp::create(builder, loc, APInt(maskWidth, 0));
+      auto never = hw::ConstantOp::create(builder, loc, APInt::getAllOnes(64));
+      
+      SmallVector<Value> yieldOperands(ret.getOperands());
+      yieldOperands.push_back(mask);
+      yieldOperands.push_back(never);
+
+      CoroutineReturnOp::create(builder, loc, yieldOperands);
       ret.erase();
       continue;
     }
@@ -642,17 +651,100 @@ LogicalResult CoroutineLowering::run() {
   return success();
 }
 
-void replaceCall(llhd::CallCoroutineOp oldCall, const ReplacementPair& replacement) {
-  OpBuilder builder(oldCall);
+LogicalResult replaceCall(llhd::CallCoroutineOp oldCall, const ReplacementPair& replacement) {
+  if (replacement.first != oldCall.getCallee()) {
+    return success(); // Not the call we are looking for
+  }
 
-        // auto newCall = CoroutineCallOp::create(
-        //     oldCall.getLoc(), 
-        //     oldCall.getResultTypes(), 
-        //     FlatSymbolRefAttr::get(builder.getContext(), replacement.second), 
-        //     oldCall.getArgOperands());
-            
-        oldCall.replaceAllUsesWith(newCall);
-        oldCall.erase();
+  OpBuilder builder(oldCall);
+  Location loc = oldCall.getLoc();
+  MLIRContext *ctx = builder.getContext();
+
+  FlatSymbolRefAttr calleeAttr = FlatSymbolRefAttr::get(ctx, replacement.second);
+
+  // 1. Setup Types
+  // Look up the lowered coroutine to get its exact return types (which include mask and wakeup)
+  auto calleeOp = mlir::SymbolTable::lookupNearestSymbolFrom<arc::CoroutineDefineOp>(oldCall, calleeAttr);
+  assert(calleeOp && "Lowered callee arc.coroutine.define not found");
+
+  Type stateType = arc::CoroutineStateType::get(ctx, calleeAttr);
+  Type pcType = arc::CoroutinePCType::get(ctx, calleeAttr);
+  
+  SmallVector<Type> callResultTypes;
+  callResultTypes.push_back(stateType);
+  callResultTypes.push_back(pcType);
+  llvm::append_range(callResultTypes, calleeOp.getResultTypes());
+
+  // 2. Isolate the continuation block
+  Block *originalBlock = oldCall->getBlock();
+  // splitBlock leaves operations before oldCall in originalBlock. 
+  // oldCall and everything after it move to continueBlock.
+  Block *continueBlock = originalBlock->splitBlock(oldCall);
+  
+  // 3. Create intermediary blocks
+  Region *parentRegion = originalBlock->getParent();
+  Block *callLoopBlock = builder.createBlock(parentRegion, Region::iterator(continueBlock));
+  Block *suspendBlock = builder.createBlock(parentRegion, Region::iterator(continueBlock));
+
+  // 4. Initial Setup (Original Block)
+  builder.setInsertionPointToEnd(originalBlock);
+  Value initialState = builder.create<arc::CoroutineUndefinedStateOp>(loc, stateType);
+  Value startPC = builder.create<arc::CoroutineStartPCOp>(loc, pcType);
+  builder.create<mlir::cf::BranchOp>(loc, callLoopBlock, ValueRange{initialState, startPC});
+
+  // 5. Build the Call Loop Block
+  builder.setInsertionPointToEnd(callLoopBlock);
+  Value currentState = callLoopBlock->addArgument(stateType, loc);
+  Value currentPC = callLoopBlock->addArgument(pcType, loc);
+
+  auto newCall = builder.create<arc::CoroutineCallOp>(
+      loc, 
+      callResultTypes, 
+      calleeAttr, 
+      currentState, 
+      currentPC, 
+      oldCall.getArgOperands()
+  );
+
+  Value resumeState = newCall.getResumeState();
+  Value resumePC = newCall.getResumePC();
+  
+  // The actual function results drop the mask and wakeup from the back
+  ValueRange callResults = newCall.getResults().drop_back(2);
+  
+  // Extract the mask and wakeup to pass up the chain
+  unsigned numResults = newCall.getNumResults();
+  Value mask = newCall.getResult(numResults - 2);
+  Value wakeup = newCall.getResult(numResults - 1);
+
+  auto isReturn = builder.create<arc::CoroutinePCIsReturnOp>(loc, builder.getI1Type(), resumePC);
+  builder.create<mlir::cf::CondBranchOp>(
+      loc, isReturn, 
+      continueBlock, callResults, // Branch true: pass callee results to continuation
+      suspendBlock, ValueRange{}  // Branch false: suspend
+  );
+
+  // 6. Build the Suspend Block
+  builder.setInsertionPointToEnd(suspendBlock);
+  builder.create<arc::CoroutineYieldOp>(
+      loc, 
+      ValueRange{mask, wakeup},             // yieldOperands: Yield the mask and wakeup to the parent
+      ValueRange{resumeState, resumePC},    // destOperands: Forwarded to callLoopBlock
+      callLoopBlock                         // dest
+  );
+
+  // 7. Finalize Continuation Block
+  builder.setInsertionPointToStart(continueBlock);
+  SmallVector<Value> continueArgs;
+  for (Type resType : oldCall.getResultTypes()) {
+    continueArgs.push_back(continueBlock->addArgument(resType, loc));
+  }
+
+  // Swap all uses of the old blocking call to the new block arguments
+  oldCall.replaceAllUsesWith(continueArgs);
+  oldCall.erase();
+
+  return success();
 }
 
 void replaceCalls(ModuleOp& module, const SmallVector<ReplacementPair>& replacements) {
@@ -710,5 +802,14 @@ void LowerProcessesPass::runOnOperation() {
     replaceCalls(module, replacements);
     
     llvm::outs() << "new module: " << module << "\n";
+  }
+
+  // ERASE THE OLD COROUTINES!
+  SmallVector<llhd::CoroutineOp> corosToErase;
+  module.walk([&](llhd::CoroutineOp op) {
+    corosToErase.push_back(op);
+  });
+  for (auto op : corosToErase) {
+    op.erase();
   }
 }
