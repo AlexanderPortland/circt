@@ -33,22 +33,6 @@ class FIRRTLIntrinsic {
 // Intrinsics
 //===----------------------------------------------------------------------===//
 
-def CirctSizeof : FIRRTLIntrinsic {
-  let mnemonic = "circt.sizeof";
-  let description = [{
-    Returns the size of a type. The input port is not read from and may be any
-    type, including uninferred types.
-
-    | Argument | Type | Description                               |
-    | -------- | ---- | ----------------------------------------- |
-    | i        | Any  | value whose type's size is to be returned |
-
-    | Result | Type     | Description       |
-    | ------ | -------- | ----------------- |
-    | size   | UInt<32> | Size of type of i |
-  }];
-}
-
 def CirctIsX : FIRRTLIntrinsic {
   let mnemonic = "circt.isX";
   let description = [{

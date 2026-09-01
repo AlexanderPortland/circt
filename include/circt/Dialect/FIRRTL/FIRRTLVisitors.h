@@ -50,7 +50,7 @@ public:
             OrRPrimOp, XorRPrimOp,
             // Intrinsic Expressions.
             IsXIntrinsicOp, PlusArgsValueIntrinsicOp, PlusArgsTestIntrinsicOp,
-            SizeOfIntrinsicOp, ClockGateIntrinsicOp, ClockInverterIntrinsicOp,
+            ClockGateIntrinsicOp, ClockInverterIntrinsicOp,
             ClockDividerIntrinsicOp, LTLAndIntrinsicOp, LTLOrIntrinsicOp,
             LTLIntersectIntrinsicOp, LTLDelayIntrinsicOp, LTLConcatIntrinsicOp,
             LTLRepeatIntrinsicOp, LTLGoToRepeatIntrinsicOp,
@@ -174,7 +174,6 @@ public:
   HANDLE(IsXIntrinsicOp, Unhandled);
   HANDLE(PlusArgsValueIntrinsicOp, Unhandled);
   HANDLE(PlusArgsTestIntrinsicOp, Unhandled);
-  HANDLE(SizeOfIntrinsicOp, Unhandled);
   HANDLE(ClockGateIntrinsicOp, Unhandled);
   HANDLE(ClockInverterIntrinsicOp, Unhandled);
   HANDLE(ClockDividerIntrinsicOp, Unhandled);

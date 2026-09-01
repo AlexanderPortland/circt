@@ -1953,7 +1953,6 @@ struct FIRRTLLowering : public FIRRTLVisitor<FIRRTLLowering, LogicalResult> {
   LogicalResult visitStmt(FPGAProbeIntrinsicOp op);
   LogicalResult visitExpr(ClockInverterIntrinsicOp op);
   LogicalResult visitExpr(ClockDividerIntrinsicOp op);
-  LogicalResult visitExpr(SizeOfIntrinsicOp op);
   LogicalResult visitExpr(ClockGateIntrinsicOp op);
   LogicalResult visitExpr(LTLAndIntrinsicOp op);
   LogicalResult visitExpr(LTLOrIntrinsicOp op);
@@ -4732,11 +4731,6 @@ LogicalResult FIRRTLLowering::visitExpr(PlusArgsValueIntrinsicOp op) {
   if (failed(setLowering(op.getFound(), valueOp.getFound())))
     return failure();
   return success();
-}
-
-LogicalResult FIRRTLLowering::visitExpr(SizeOfIntrinsicOp op) {
-  op.emitError("SizeOf should have been resolved.");
-  return failure();
 }
 
 LogicalResult FIRRTLLowering::visitExpr(ClockGateIntrinsicOp op) {

@@ -5842,11 +5842,6 @@ FIRRTLType DShrPrimOp::inferReturnType(FIRRTLType lhs, FIRRTLType rhs,
 // Unary Primitives
 //===----------------------------------------------------------------------===//
 
-FIRRTLType SizeOfIntrinsicOp::inferReturnType(FIRRTLType input,
-                                              std::optional<Location> loc) {
-  return UIntType::get(input.getContext(), 32);
-}
-
 FIRRTLType AsSIntPrimOp::inferReturnType(FIRRTLType input,
                                          std::optional<Location> loc) {
   auto base = type_dyn_cast<FIRRTLBaseType>(input);
@@ -6656,9 +6651,6 @@ void AndRPrimOp::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
   genericAsmResultNames(*this, setNameFn);
 }
 
-void SizeOfIntrinsicOp::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
-  genericAsmResultNames(*this, setNameFn);
-}
 void AsAsyncResetPrimOp::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
   genericAsmResultNames(*this, setNameFn);
 }

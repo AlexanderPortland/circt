@@ -887,10 +887,7 @@ firrtl.circuit "Foo" {
                                          out %io3: !firrtl.uint<1>,
                                          out %io4: !firrtl.uint<5>) {
     // Common case should be emitted inline.
-    // CHECK: connect s, intrinsic(circt_sizeof : UInt<32>, clk)
-    %0 = firrtl.int.generic "circt_sizeof"  %clk : (!firrtl.clock) -> !firrtl.uint<32>
-    firrtl.matchingconnect %s, %0 : !firrtl.uint<32>
-    // CHECK-NEXT: connect io1, intrinsic(circt_isX : UInt<1>, clk)
+    // CHECK: connect io1, intrinsic(circt_isX : UInt<1>, clk)
     %1 = firrtl.int.generic "circt_isX"  %clk : (!firrtl.clock) -> !firrtl.uint<1>
     firrtl.matchingconnect %io1, %1 : !firrtl.uint<1>
     // CHECK-NEXT: connect io2, intrinsic(circt_plusargs_test<FORMAT = "foo"> : UInt<1>)

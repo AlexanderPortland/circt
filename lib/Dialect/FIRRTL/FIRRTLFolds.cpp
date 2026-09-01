@@ -998,14 +998,6 @@ OpFoldResult IntegerShlOp::fold(FoldAdaptor adaptor) {
 // Unary Operators
 //===----------------------------------------------------------------------===//
 
-OpFoldResult SizeOfIntrinsicOp::fold(FoldAdaptor) {
-  auto base = getInput().getType();
-  auto w = getBitWidth(base);
-  if (w)
-    return getIntAttr(getType(), APInt(32, *w));
-  return {};
-}
-
 OpFoldResult IsXIntrinsicOp::fold(FoldAdaptor adaptor) {
   // No constant can be 'x' by definition.
   if (auto cst = getConstant(adaptor.getArg()))

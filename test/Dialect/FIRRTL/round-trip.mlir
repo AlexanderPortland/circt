@@ -14,9 +14,6 @@ firrtl.module @Top(in %arg0: !firrtl.uint<1>) attributes {portNames = [""]} {}
 
 // CHECK-LABEL: firrtl.module @Intrinsics
 firrtl.module @Intrinsics(in %ui : !firrtl.uint, in %clock: !firrtl.clock, in %ui1: !firrtl.uint<1>) {
-  // CHECK-NEXT: firrtl.int.sizeof %ui : (!firrtl.uint) -> !firrtl.uint<32>
-  %size = firrtl.int.sizeof %ui : (!firrtl.uint) -> !firrtl.uint<32>
-
   // CHECK-NEXT: firrtl.int.isX %ui : !firrtl.uint
   %isx = firrtl.int.isX %ui : !firrtl.uint
 

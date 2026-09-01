@@ -217,15 +217,6 @@ void IntrinsicLoweringInterfaceCollection::populateIntrinsicLowerings(
 
 namespace {
 
-class CirctSizeofConverter : public IntrinsicOpConverter<SizeOfIntrinsicOp> {
-public:
-  using IntrinsicOpConverter::IntrinsicOpConverter;
-
-  bool check(GenericIntrinsic gi) override {
-    return gi.hasNInputs(1) || gi.sizedOutput<UIntType>(32) || gi.hasNParam(0);
-  }
-};
-
 class CirctIsXConverter : public IntrinsicOpConverter<IsXIntrinsicOp> {
 public:
   using IntrinsicOpConverter::IntrinsicOpConverter;

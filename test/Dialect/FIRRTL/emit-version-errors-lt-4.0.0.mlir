@@ -11,18 +11,6 @@ firrtl.circuit "EnabledLayers" {
 
 // -----
 
-// generic intrinsic expression requires >= 4.0.0.  The intrinsic is consumed
-// by a firrtl.node so it is emitted inline; the error fires on the intrinsic op.
-firrtl.circuit "GenericIntrinsic" {
-  firrtl.module @GenericIntrinsic(in %clk : !firrtl.clock) {
-    // expected-error @below {{'firrtl.int.generic' op generic intrinsics requires FIRRTL 4.0.0}}
-    %0 = firrtl.int.generic "circt_sizeof" %clk : (!firrtl.clock) -> !firrtl.uint<32>
-    %n = firrtl.node %0 : !firrtl.uint<32>
-  }
-}
-
-// -----
-
 // formal test declaration requires >= 4.0.0.  The circuit must contain a
 // module matching its name (@FormalTest) for FIRRTL verification; the
 // referenced target module (@FormalTop) is placed after the formal op so the

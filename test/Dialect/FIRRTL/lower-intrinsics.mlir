@@ -4,10 +4,6 @@
 firrtl.circuit "Foo" {
   // CHECK-LABEL: @Foo
   firrtl.module @Foo(in %clk : !firrtl.clock, out %s : !firrtl.uint<32>, out %io1 : !firrtl.uint<1>, out %io2 : !firrtl.uint<1>, out %io3 : !firrtl.uint<1>, out %io4 : !firrtl.uint<5>) {
-    // CHECK: firrtl.int.sizeof %clk
-    %size = firrtl.int.generic "circt.sizeof"  %clk : (!firrtl.clock) -> !firrtl.uint<32>
-    firrtl.matchingconnect %s, %size : !firrtl.uint<32>
-
     // CHECK: firrtl.int.isX
     %isX = firrtl.int.generic "circt.isX"  %clk : (!firrtl.clock) -> !firrtl.uint<1>
     firrtl.matchingconnect %io1, %isX : !firrtl.uint<1>

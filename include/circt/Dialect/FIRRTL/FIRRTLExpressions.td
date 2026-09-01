@@ -752,8 +752,6 @@ class UnaryPrimOp<string mnemonic, Type srcType, Type resultType,
 
 }
 
-def SizeOfIntrinsicOp : UnaryPrimOp<"int.sizeof", FIRRTLBaseType, UInt32Type>;
-
 let hasCanonicalizer=1 in {
   def AsSIntPrimOp : UnaryPrimOp<"asSInt", FIRRTLBaseType, SIntType>;
   def AsUIntPrimOp : UnaryPrimOp<"asUInt", FIRRTLBaseType, UIntType>;
